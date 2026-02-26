@@ -1,0 +1,593 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Fluid Particle Simulation</title>
+    <style>
+        body { margin:0; padding:0; background:#000; color:#fff; font-family:'Courier New',monospace; overflow:hidden; user-select:none; }
+        #canvas-container { position:absolute; top:0; left:0; width:100vw; height:100vh; z-index:3; }
+        #videoElement { position:absolute; top:0; left:0; width:100vw; height:100vh; object-fit:cover; z-index:0; transform:scaleX(-1); }
+        #black-fg { position:absolute; top:0; left:0; width:100vw; height:100vh; z-index:1; background:#000; display:none; pointer-events:none; }
+        #tracking-canvas { position:absolute; top:0; left:0; width:100vw; height:100vh; object-fit:cover; z-index:2; transform:scaleX(-1); pointer-events:none; }
+        #hud { position:fixed; bottom:18px; left:50%; transform:translateX(-50%); display:flex; flex-direction:column; align-items:center; gap:5px; z-index:20; pointer-events:none; }
+        #confidence-label { font-size:9px; color:#555; letter-spacing:.12em; }
+        #confidence-bar { width:130px; height:5px; background:#1a1a1a; border-radius:3px; overflow:hidden; }
+        #confidence-fill { height:100%; width:0%; background:linear-gradient(90deg,#f33,#fa0,#0c5); border-radius:3px; }
+        #mode-label { font-size:10px; color:#666; letter-spacing:.08em; }
+        #mode-label.inertia { color:#4af; }
+        .lil-gui { z-index:10 !important; }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/drawing_utils/drawing_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/lil-gui@0.19"></script>
+</head>
+<body>
+<video id="videoElement" autoplay playsinline></video>
+<div id="black-fg"></div>
+<canvas id="tracking-canvas"></canvas>
+<div id="canvas-container"></div>
+<div id="hud">
+    <div id="mode-label">ROTATION MODE</div>
+    <div id="confidence-label">PALM ORIENTATION</div>
+    <div id="confidence-bar"><div id="confidence-fill"></div></div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════
+//  CONFIG & GUI
+// ═══════════════════════════════════════════════════════════
+const params = {
+    // Physics
+    gravityY:        -0.02,
+    damping:          1.0,
+    wallBounce:       1.0,
+    wallFriction:     1.0,
+    restDensity:      6.5,
+    stiffness:        0.003,
+    nearStiffness:    0.05,
+    viscosity:        0.1,
+    colorSensitivity: 4.0,
+    boxScale:         1.0,
+    numParticles:     2000,    // NEW
+    // Tracking
+    smoothing:        0.15,
+    sliceThreshold:   0.20,
+    showSkeleton:     true,    // NEW
+    followHand:       true,    // NEW
+    lockZRot:         false,   // NEW – no spinning around screen normal
+    zOffset:          0,       // NEW – degrees, corrects middle-finger alignment
+    // Modes
+    inertiaMode:      false,
+    inertiaScale:     12.0,
+    // Face cover
+    blackForeground:  false,
+};
+
+const gui = new lil.GUI({ title: 'Simulation Settings' });
+
+// ── Physics folder ───────────────────────────────────────
+const physFolder = gui.addFolder('Fluid Physics');
+physFolder.add(params, 'numParticles', 200, 6000, 100).name('Particle Count');
+// Button to apply particle count (rebuilds arrays + geometry)
+const rebuildBtn = { 'Apply Particle Count': () => rebuildParticles(Math.round(params.numParticles)) };
+physFolder.add(rebuildBtn, 'Apply Particle Count');
+physFolder.add(params, 'boxScale', 0.4, 2.0, 0.05).name('Box Scale');
+physFolder.add(params, 'gravityY', -0.3, 0, 0.01).name('Gravity');
+physFolder.add(params, 'damping', 0.9, 1.0, 0.001).name('Damping');
+physFolder.add(params, 'wallBounce', 0, 1, 0.01).name('Wall Bounce');
+physFolder.add(params, 'wallFriction', 0, 1, 0.01).name('Wall Friction');
+physFolder.add(params, 'restDensity', 1, 30, 0.5).name('Rest Density');
+physFolder.add(params, 'stiffness', 0.001, 0.05, 0.001).name('Stiffness');
+physFolder.add(params, 'nearStiffness', 0.001, 0.05, 0.001).name('Near Stiffness');
+physFolder.add(params, 'viscosity', 0, 0.1, 0.001).name('Viscosity');
+physFolder.add(params, 'colorSensitivity', 0.5, 10, 0.1).name('Color Range');
+
+// ── Tracking folder ──────────────────────────────────────
+const trackFolder = gui.addFolder('Hand Tracking');
+trackFolder.add(params, 'showSkeleton').name('Show Skeleton').onChange(v => {
+    document.getElementById('tracking-canvas').style.visibility = v ? 'visible' : 'hidden';
+});
+trackFolder.add(params, 'followHand').name('Cube Follows Hand');
+trackFolder.add(params, 'lockZRot').name('Lock Z Rotation');
+trackFolder.add(params, 'zOffset', -180, 180, 1).name('Z Offset (°)');
+trackFolder.add(params, 'smoothing', 0.01, 0.5, 0.01).name('Smoothing');
+trackFolder.add(params, 'sliceThreshold', 0.0, 0.8, 0.05).name('Slice Guard');
+trackFolder.add(params, 'inertiaMode').name('Fluid Inertia Mode').onChange(v => {
+    modeLabel.textContent = v ? 'INERTIA MODE  (rotation locked)' : 'ROTATION MODE';
+    modeLabel.classList.toggle('inertia', v);
+});
+trackFolder.add(params, 'inertiaScale', 1, 40, 1).name('Inertia Strength');
+trackFolder.add(params, 'blackForeground').name('Black Foreground').onChange(v => {
+    document.getElementById('black-fg').style.display = v ? 'block' : 'none';
+});
+
+// ═══════════════════════════════════════════════════════════
+//  THREE.JS SCENE
+// ═══════════════════════════════════════════════════════════
+const container = document.getElementById('canvas-container');
+const scene     = new THREE.Scene();
+const camera    = new THREE.PerspectiveCamera(45, window.innerWidth / window.innerHeight, 0.1, 100);
+camera.position.set(0, 0, 22);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setSize(window.innerWidth, window.innerHeight);
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.25));
+container.appendChild(renderer.domElement);
+
+const BOX_SIZE = 8.0;
+const halfBox  = BOX_SIZE / 2;
+const boxMesh  = new THREE.Object3D();
+scene.add(boxMesh);
+
+const edges        = new THREE.EdgesGeometry(new THREE.BoxGeometry(BOX_SIZE, BOX_SIZE, BOX_SIZE));
+const lineMaterial = new THREE.LineBasicMaterial({ color: 0x888888, transparent: true, opacity: 0.5 });
+boxMesh.add(new THREE.LineSegments(edges, lineMaterial));
+
+// ═══════════════════════════════════════════════════════════
+//  PARTICLE SYSTEM  (rebuildable)
+// ═══════════════════════════════════════════════════════════
+const interactionRadius   = 0.65;
+const interactionRadiusSq = interactionRadius * interactionRadius;
+const cellSize            = interactionRadius;
+const gridDim             = Math.ceil(BOX_SIZE / cellSize) + 2;
+const gridTotal           = gridDim * gridDim * gridDim;
+
+// These are let so rebuildParticles() can replace them
+let NUM_P          = params.numParticles;
+let positions      = null;
+let velocities     = null;
+let densities      = null;
+let nearDensities  = null;
+let head           = new Int32Array(gridTotal);
+let next           = null;
+let particlesGeometry = null;
+let particlesMesh     = null;
+
+// One shared material — reused across rebuilds
+const particleMaterial = new THREE.PointsMaterial({
+    size: 0.45,
+    map: (() => {
+        const c = document.createElement('canvas'); c.width = c.height = 64;
+        const x = c.getContext('2d');
+        x.beginPath(); x.arc(32,32,28,0,Math.PI*2);
+        x.fillStyle='#fff'; x.fill(); x.lineWidth=4; x.strokeStyle='#aaa'; x.stroke();
+        const t = new THREE.CanvasTexture(c); t.needsUpdate=true; return t;
+    })(),
+    vertexColors: true,
+    transparent: true, opacity: 1.0, depthWrite: true,
+    blending: THREE.NormalBlending,
+});
+
+function rebuildParticles(n) {
+    NUM_P = n;
+
+    // Remove & dispose old mesh
+    if (particlesMesh) {
+        boxMesh.remove(particlesMesh);
+        particlesGeometry.dispose();
+    }
+
+    // Allocate new typed arrays
+    positions     = new Float32Array(n * 3);
+    velocities    = new Float32Array(n * 3);
+    densities     = new Float32Array(n);
+    nearDensities = new Float32Array(n);
+    next          = new Int32Array(n);
+
+    // Lattice initialisation
+    const side    = Math.ceil(Math.pow(n, 1 / 3));
+    const spacing = interactionRadius * 0.75;
+    const ox = -(side * spacing) / 2;
+    const oy = -halfBox + 0.2;
+    const oz = -(side * spacing) / 2;
+    for (let i = 0; i < n; i++) {
+        const ix = i % side;
+        const iy = Math.floor(i / (side * side));
+        const iz = Math.floor(i / side) % side;
+        const jitter = (i % 5) * 0.01;
+        positions[i*3]   = ox + ix*spacing + jitter;
+        positions[i*3+1] = oy + iy*spacing + jitter;
+        positions[i*3+2] = oz + iz*spacing + jitter;
+    }
+
+    // Colour buffer
+    const colors = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) { colors[i*3]=0.05; colors[i*3+1]=0.1; colors[i*3+2]=0.5; }
+
+    particlesGeometry = new THREE.BufferGeometry();
+    particlesGeometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+    particlesGeometry.setAttribute('color',    new THREE.BufferAttribute(colors,    3));
+
+    particlesMesh = new THREE.Points(particlesGeometry, particleMaterial);
+    boxMesh.add(particlesMesh);
+}
+
+// Initial build
+rebuildParticles(params.numParticles);
+
+// ═══════════════════════════════════════════════════════════
+//  INTERACTION STATE
+// ═══════════════════════════════════════════════════════════
+let targetQuat   = new THREE.Quaternion();
+let currentQuat  = new THREE.Quaternion();
+let targetPos    = new THREE.Vector3();
+let currentPos   = new THREE.Vector3();
+let currentScale = 1.0;
+let paused       = false;
+let lastGoodQuat = new THREE.Quaternion();
+
+// Inertia tracking
+let prevBoxPos   = new THREE.Vector3();
+let boxVel       = new THREE.Vector3();
+let prevBoxVel   = new THREE.Vector3();
+let inertiaWorld = new THREE.Vector3();
+
+// ── Mouse / touch fallback ───────────────────────────────
+let isMouseOverriding = false, mouseTimer = null;
+let isDragging = false, prevMouse = {x:0,y:0};
+let mouseRot = new THREE.Euler(0,0,0,'YXZ');
+
+function engageMouse() {
+    isMouseOverriding = true;
+    clearTimeout(mouseTimer);
+    mouseTimer = setTimeout(() => { isMouseOverriding = false; }, 1500);
+}
+document.addEventListener('mousedown',  e => { if(e.target.closest('.lil-gui'))return; isDragging=true; engageMouse(); });
+document.addEventListener('mouseup',    () => { isDragging=false; engageMouse(); });
+document.addEventListener('mousemove',  e => {
+    if (isDragging) {
+        mouseRot.x += (e.offsetY - prevMouse.y) * 0.01;
+        mouseRot.y += (e.offsetX - prevMouse.x) * 0.01;
+        mouseRot.x  = Math.max(-Math.PI/2, Math.min(Math.PI/2, mouseRot.x));
+        targetQuat.setFromEuler(mouseRot); engageMouse();
+    }
+    prevMouse = {x:e.offsetX, y:e.offsetY};
+});
+document.addEventListener('touchstart', e => { if(e.target.closest('.lil-gui'))return; isDragging=true; prevMouse={x:e.touches[0].clientX,y:e.touches[0].clientY}; engageMouse(); });
+document.addEventListener('touchend',   () => { isDragging=false; engageMouse(); });
+document.addEventListener('touchmove',  e => {
+    if (isDragging) {
+        mouseRot.x += (e.touches[0].clientY - prevMouse.y) * 0.01;
+        mouseRot.y += (e.touches[0].clientX - prevMouse.x) * 0.01;
+        mouseRot.x  = Math.max(-Math.PI/2, Math.min(Math.PI/2, mouseRot.x));
+        targetQuat.setFromEuler(mouseRot);
+        prevMouse = {x:e.touches[0].clientX,y:e.touches[0].clientY}; engageMouse();
+    }
+});
+
+// ═══════════════════════════════════════════════════════════
+//  MEDIAPIPE
+// ═══════════════════════════════════════════════════════════
+const videoElement   = document.getElementById('videoElement');
+const trackingCanvas = document.getElementById('tracking-canvas');
+const trackingCtx    = trackingCanvas.getContext('2d');
+const confidenceFill = document.getElementById('confidence-fill');
+const modeLabel      = document.getElementById('mode-label');
+
+const hands = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
+hands.setOptions({ maxNumHands:1, modelComplexity:0, minDetectionConfidence:0.6, minTrackingConfidence:0.6 });
+
+// Helper: apply Z-axis constraints and offset to a quaternion, return result
+// lockZ = true  → strip world-Z spin entirely (swing-twist decomposition), then apply offset
+// lockZ = false → just apply offset as a post-multiply on local cube Z
+function applyZConstraints(q) {
+    const zOffRad = THREE.MathUtils.degToRad(params.zOffset);
+
+    if (params.lockZRot) {
+        // ── Swing-twist decomposition around world Z axis ──
+        // Twist = component of q that rotates around Z.
+        // Swing = remaining tilt (rotates around X and Y only).
+        // We discard the twist and keep only the swing, then add the user's fixed Z offset.
+        const qv    = new THREE.Vector3(q.x, q.y, q.z);
+        const zAxis = new THREE.Vector3(0, 0, 1);
+        const proj  = zAxis.clone().multiplyScalar(qv.dot(zAxis)); // project onto Z
+        let twist   = new THREE.Quaternion(proj.x, proj.y, proj.z, q.w);
+        if (twist.w < 0) twist.negate(); // ensure consistent half-angle
+        twist.normalize();
+        // Swing = q * twist⁻¹
+        const swing = q.clone().multiply(twist.clone().invert());
+        // Apply fixed Z offset on top of the swing
+        const zFixQ = new THREE.Quaternion().setFromAxisAngle(zAxis, zOffRad);
+        return swing.premultiply(zFixQ);
+    } else {
+        // Just add Z offset as a local rotation around cube's own Z axis
+        const zFixQ = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,0,1), zOffRad);
+        return q.clone().multiply(zFixQ);
+    }
+}
+
+hands.onResults(results => {
+    if (videoElement.videoWidth) {
+        trackingCanvas.width  = videoElement.videoWidth;
+        trackingCanvas.height = videoElement.videoHeight;
+    }
+    trackingCtx.clearRect(0, 0, trackingCanvas.width, trackingCanvas.height);
+
+    if (!results.multiHandLandmarks?.length) {
+        paused = false;
+        lineMaterial.color.setHex(0x888888);
+        confidenceFill.style.width = '0%';
+        if (!isMouseOverriding) {
+            if (params.followHand) targetPos.set(0, 0, 0);
+            targetQuat.identity();
+        }
+        return;
+    }
+    if (params.showSkeleton) {
+        for (const lm of results.multiHandLandmarks) {
+            drawConnectors(trackingCtx, lm, HAND_CONNECTIONS, {color:'#ffffff', lineWidth:3});
+            drawLandmarks(trackingCtx, lm, {color:'#4488ff', lineWidth:1, radius:3});
+        }
+    }
+
+    const lm    = results.multiHandLandmarks[0];
+    const wrist = lm[0];
+
+    // Fist → pause
+    const tips=[8,12,16,20], mcps=[5,9,13,17];
+    let curled = 0;
+    for (let i=0;i<4;i++) {
+        if (Math.hypot(lm[tips[i]].x-wrist.x,lm[tips[i]].y-wrist.y) <
+            Math.hypot(lm[mcps[i]].x-wrist.x,lm[mcps[i]].y-wrist.y)) curled++;
+    }
+    paused = (curled === 4);
+    lineMaterial.color.setHex(paused ? 0x00aaff : 0x888888);
+
+    if (isMouseOverriding) return;
+
+    // ── Position ──────────────────────────────────────────
+    if (params.followHand) {
+        const mid = lm[9];
+        const dist = camera.position.z;
+        const fH   = 2 * Math.tan((camera.fov * Math.PI / 180) / 2) * dist;
+        const fW   = fH * camera.aspect;
+        targetPos.x = -(mid.x - 0.5) * fW;
+        targetPos.y = -(mid.y - 0.5) * fH;
+    }
+
+    // Skip rotation when paused or inertia mode
+    if (paused || params.inertiaMode) return;
+
+    // ── Rotation ──────────────────────────────────────────
+    // Coordinate mapping MediaPipe → Three.js:
+    //   MP x:  0→1 left→right in raw (un-mirrored) camera frame
+    //   MP y:  0→1 top→bottom
+    //   MP z:  relative depth (positive = further from camera than wrist)
+    //
+    //   We negate x: compensates for CSS scaleX(-1) mirror on video
+    //   We negate y: flips image-y (down) to world-y (up)
+    //   We negate z: makes "closer to camera" positive (toward viewer = +Z)
+    const mkV = i => new THREE.Vector3(-lm[i].x, -lm[i].y, -lm[i].z);
+
+    const vW = mkV(0);   // wrist
+    const vI = mkV(5);   // index knuckle (MCP)
+    const vP = mkV(17);  // pinky knuckle (MCP)
+    const vM = mkV(9);   // middle knuckle (MCP) – direction anchor
+
+    const indVec   = new THREE.Vector3().subVectors(vI, vW);
+    const pinkyVec = new THREE.Vector3().subVectors(vP, vW);
+
+    // Cross product gives palm normal.
+    // sin(angle) = cross.length / (|a|·|b|) → 1 when palm faces camera, 0 when edge-on.
+    const cross    = new THREE.Vector3().crossVectors(pinkyVec, indVec);
+    const sinAngle = cross.length() / Math.max(indVec.length() * pinkyVec.length(), 1e-6);
+
+    confidenceFill.style.width = `${Math.min(sinAngle, 1.0) * 100}%`;
+
+    if (sinAngle < params.sliceThreshold) {
+        targetQuat.copy(lastGoodQuat);
+        return;
+    }
+
+    const fingersDir = new THREE.Vector3().subVectors(vM, vW).normalize();
+    const palmNormal = cross.normalize();
+
+    // Handedness: MediaPipe labels from the RAW camera frame.
+    // With CSS mirror: camera-Left label = user's right hand (cross already toward viewer, OK)
+    //                  camera-Right label = user's left hand (cross points away, negate)
+    const mpLabel = results.multiHandedness?.[0]?.label;
+    if (mpLabel === 'Right') palmNormal.negate();
+
+    // Re-orthogonalize: ensure perfect 90° between axes
+    // We want: X = Y × Z where Y=fingersDir, Z=palmNormal
+    const handRight = new THREE.Vector3().crossVectors(fingersDir, palmNormal).normalize();
+    palmNormal.crossVectors(handRight, fingersDir).normalize(); // Z = X × Y
+
+    // ── Basis mapping: palm = cube back face ──────────────
+    //
+    //  cube local X  =  handRight   (across knuckles, left–right of cube)
+    //  cube local Y  =  fingersDir  (wrist→fingers = "up" of cube)
+    //  cube local Z  =  palmNormal  (out of palm  = front face of cube toward viewer)
+    //
+    // Why this is correct:
+    //   • palmNormal ≈ (0,0,+1) when palm faces camera → cube front face faces camera ✓
+    //   • Tilt fingers toward screen → fingersDir.z goes negative → cube Y tilts into screen
+    //     → cube top face tilts forward ✓
+    //   • Wrist twist (pronation) keeps fingersDir roughly same, rotates palmNormal & handRight
+    //     around fingersDir → cube rotates around its Y axis ✓
+    //
+    // No offset quaternion needed — the basis directly expresses the desired correspondence.
+    const mat      = new THREE.Matrix4().makeBasis(handRight, fingersDir, palmNormal);
+    const handQuat = new THREE.Quaternion().setFromRotationMatrix(mat);
+
+    // Apply Z constraints (lock and/or offset)
+    const finalQuat = applyZConstraints(handQuat);
+
+    // Assign directly — the animate loop's slerp provides all smoothing.
+    targetQuat.copy(finalQuat);
+    lastGoodQuat.copy(finalQuat);
+});
+
+const cameraFeed = new Camera(videoElement, {
+    onFrame: async () => {
+        try { await hands.send({image: videoElement}); } catch(e){}
+    },
+    width: 320, height: 240,
+});
+cameraFeed.start().catch(() => console.warn('Camera unavailable.'));
+
+// ═══════════════════════════════════════════════════════════
+//  ANIMATION + PHYSICS LOOP
+// ═══════════════════════════════════════════════════════════
+const localGravity = new THREE.Vector3();
+const baseGravity  = new THREE.Vector3();
+let physicsFrame   = 0;
+
+function animate() {
+    requestAnimationFrame(animate);
+    physicsFrame++;
+
+    // ── Box transform ──────────────────────────────────────
+    currentPos.lerp(targetPos, params.smoothing);
+    boxMesh.position.copy(currentPos);
+    currentQuat.slerp(targetQuat, params.smoothing);
+    boxMesh.quaternion.copy(currentQuat);
+    currentScale += (params.boxScale - currentScale) * 0.1;
+    boxMesh.scale.set(currentScale, currentScale, currentScale);
+
+    // ── Inertia: world-space box velocity → local pseudo-force ──
+    boxVel.subVectors(currentPos, prevBoxPos);
+    const accel = new THREE.Vector3().subVectors(boxVel, prevBoxVel);
+    prevBoxVel.copy(boxVel);
+    prevBoxPos.copy(currentPos);
+    inertiaWorld.multiplyScalar(0.75);
+    inertiaWorld.addScaledVector(accel, -params.inertiaScale);
+
+    // ── SPH Physics (every other frame) ──────────────────
+    if (!paused && physicsFrame % 2 === 0) {
+        baseGravity.set(0, params.gravityY, 0);
+        const invQuat = currentQuat.clone().invert();
+        localGravity.copy(baseGravity).applyQuaternion(invQuat);
+        if (params.inertiaMode) {
+            localGravity.addScaledVector(inertiaWorld.clone().applyQuaternion(invQuat), 1.0);
+        }
+
+        const dynLim = halfBox * currentScale - 0.1;
+        const N = NUM_P;
+
+        // Build spatial hash
+        head.fill(-1);
+        for (let i = 0; i < N; i++) {
+            const i3 = i * 3;
+            velocities[i3]   += localGravity.x;
+            velocities[i3+1] += localGravity.y;
+            velocities[i3+2] += localGravity.z;
+            positions[i3]    += velocities[i3];
+            positions[i3+1]  += velocities[i3+1];
+            positions[i3+2]  += velocities[i3+2];
+
+            // Wall collisions
+            if (positions[i3]<-dynLim){positions[i3]=-dynLim;if(velocities[i3]<0){velocities[i3]*=-params.wallBounce;velocities[i3+1]*=params.wallFriction;velocities[i3+2]*=params.wallFriction;}}
+            else if(positions[i3]>dynLim){positions[i3]=dynLim;if(velocities[i3]>0){velocities[i3]*=-params.wallBounce;velocities[i3+1]*=params.wallFriction;velocities[i3+2]*=params.wallFriction;}}
+            if (positions[i3+1]<-dynLim){positions[i3+1]=-dynLim;if(velocities[i3+1]<0){velocities[i3+1]*=-params.wallBounce;velocities[i3]*=params.wallFriction;velocities[i3+2]*=params.wallFriction;}}
+            else if(positions[i3+1]>dynLim){positions[i3+1]=dynLim;if(velocities[i3+1]>0){velocities[i3+1]*=-params.wallBounce;velocities[i3]*=params.wallFriction;velocities[i3+2]*=params.wallFriction;}}
+            if (positions[i3+2]<-dynLim){positions[i3+2]=-dynLim;if(velocities[i3+2]<0){velocities[i3+2]*=-params.wallBounce;velocities[i3]*=params.wallFriction;velocities[i3+1]*=params.wallFriction;}}
+            else if(positions[i3+2]>dynLim){positions[i3+2]=dynLim;if(velocities[i3+2]>0){velocities[i3+2]*=-params.wallBounce;velocities[i3]*=params.wallFriction;velocities[i3+1]*=params.wallFriction;}}
+
+            const cx=Math.max(0,Math.min(gridDim-1,Math.floor((positions[i3]  +halfBox)/cellSize)+1));
+            const cy=Math.max(0,Math.min(gridDim-1,Math.floor((positions[i3+1]+halfBox)/cellSize)+1));
+            const cz=Math.max(0,Math.min(gridDim-1,Math.floor((positions[i3+2]+halfBox)/cellSize)+1));
+            const h = cx + cy*gridDim + cz*gridDim*gridDim;
+            next[i] = head[h]; head[h] = i;
+        }
+
+        // Density pass
+        for (let i = 0; i < N; i++) {
+            const i3=i*3; let d=0,nd=0;
+            const cx=Math.max(0,Math.min(gridDim-1,Math.floor((positions[i3]  +halfBox)/cellSize)+1));
+            const cy=Math.max(0,Math.min(gridDim-1,Math.floor((positions[i3+1]+halfBox)/cellSize)+1));
+            const cz=Math.max(0,Math.min(gridDim-1,Math.floor((positions[i3+2]+halfBox)/cellSize)+1));
+            for(let ox=-1;ox<=1;ox++) for(let oy=-1;oy<=1;oy++) for(let oz=-1;oz<=1;oz++){
+                const h=(cx+ox)+(cy+oy)*gridDim+(cz+oz)*gridDim*gridDim;
+                if(h<0||h>=gridTotal) continue;
+                let j=head[h];
+                while(j!==-1){
+                    const j3=j*3;
+                    const dx=positions[i3]-positions[j3],dy=positions[i3+1]-positions[j3+1],dz=positions[i3+2]-positions[j3+2];
+                    const dsq=dx*dx+dy*dy+dz*dz;
+                    if(dsq<interactionRadiusSq){const q=1.0-Math.sqrt(dsq)/interactionRadius;d+=q*q;nd+=q*q*q;}
+                    j=next[j];
+                }
+            }
+            densities[i]=d; nearDensities[i]=nd;
+        }
+
+        // Pressure + viscosity pass
+        for (let i = 0; i < N; i++) {
+            const i3=i*3;
+            const pi=(densities[i]-params.restDensity)*params.stiffness;
+            const npi=nearDensities[i]*params.nearStiffness;
+            let fx=0,fy=0,fz=0;
+            const cx=Math.max(0,Math.min(gridDim-1,Math.floor((positions[i3]  +halfBox)/cellSize)+1));
+            const cy=Math.max(0,Math.min(gridDim-1,Math.floor((positions[i3+1]+halfBox)/cellSize)+1));
+            const cz=Math.max(0,Math.min(gridDim-1,Math.floor((positions[i3+2]+halfBox)/cellSize)+1));
+            for(let ox=-1;ox<=1;ox++) for(let oy=-1;oy<=1;oy++) for(let oz=-1;oz<=1;oz++){
+                const h=(cx+ox)+(cy+oy)*gridDim+(cz+oz)*gridDim*gridDim;
+                if(h<0||h>=gridTotal) continue;
+                let j=head[h];
+                while(j!==-1){
+                    if(i!==j){
+                        const j3=j*3;
+                        let dx=positions[i3]-positions[j3],dy=positions[i3+1]-positions[j3+1],dz=positions[i3+2]-positions[j3+2];
+                        let dsq=dx*dx+dy*dy+dz*dz;
+                        if(dsq<interactionRadiusSq){
+                            if(dsq<1e-6){dx=0.002*((i%3)-1);dy=0.002*((j%3)-1);dz=0.002*(((i+j)%3)-1);if(!dx&&!dy&&!dz)dx=0.002;dsq=dx*dx+dy*dy+dz*dz;}
+                            const dist=Math.sqrt(dsq),q=1.0-dist/interactionRadius;
+                            const pj=(densities[j]-params.restDensity)*params.stiffness;
+                            const npj=nearDensities[j]*params.nearStiffness;
+                            const fm=Math.max(-0.002,Math.min((pi+pj)*0.5*q+(npi+npj)*0.5*q*q,0.015));
+                            const inv=1.0/dist;
+                            fx+=dx*inv*fm; fy+=dy*inv*fm; fz+=dz*inv*fm;
+                            fx-=(velocities[i3]  -velocities[j3])  *params.viscosity*q;
+                            fy-=(velocities[i3+1]-velocities[j3+1])*params.viscosity*q;
+                            fz-=(velocities[i3+2]-velocities[j3+2])*params.viscosity*q;
+                        }
+                    }
+                    j=next[j];
+                }
+            }
+            velocities[i3]  =(velocities[i3]  +fx)*params.damping;
+            velocities[i3+1]=(velocities[i3+1]+fy)*params.damping;
+            velocities[i3+2]=(velocities[i3+2]+fz)*params.damping;
+            if(isNaN(velocities[i3])){velocities[i3]=velocities[i3+1]=velocities[i3+2]=0;}
+            else{
+                const spd=velocities[i3]*velocities[i3]+velocities[i3+1]*velocities[i3+1]+velocities[i3+2]*velocities[i3+2];
+                if(spd>1.0){const inv=1.0/Math.sqrt(spd);velocities[i3]*=inv;velocities[i3+1]*=inv;velocities[i3+2]*=inv;}
+            }
+        }
+    }
+
+    // ── Colour mapping (every frame) ─────────────────────
+    const ca = particlesGeometry.attributes.color.array;
+    const br = paused ? 0.3 : 1.0;
+    const N  = NUM_P;
+    for(let i=0;i<N;i++){
+        const i3=i*3;
+        const vx=velocities[i3],vy=velocities[i3+1],vz=velocities[i3+2];
+        const t=Math.min(Math.sqrt(vx*vx+vy*vy+vz*vz)*params.colorSensitivity,1.0);
+        let r,g,b;
+        if(t<0.4){const n=t/0.4;r=(0.05-0.05*n)*br;g=(0.10+0.70*n)*br;b=(0.50+0.40*n)*br;}
+        else if(t<0.8){const n=(t-0.4)/0.4;r=n*br;g=(0.80+0.10*n)*br;b=(0.90-0.90*n)*br;}
+        else{const n=(t-0.8)/0.2;r=br;g=(0.90-0.70*n)*br;b=0;}
+        ca[i3]  +=(r-ca[i3]  )*0.1;
+        ca[i3+1]+=(g-ca[i3+1])*0.1;
+        ca[i3+2]+=(b-ca[i3+2])*0.1;
+    }
+    particlesGeometry.attributes.color.needsUpdate    = true;
+    particlesGeometry.attributes.position.needsUpdate = true;
+    renderer.render(scene, camera);
+}
+
+window.addEventListener('resize', () => {
+    camera.aspect = window.innerWidth / window.innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+animate();
+</script>
+</body>
+</html>
