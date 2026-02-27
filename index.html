@@ -51,14 +51,14 @@ const params = {
     viscosity:        0.1,
     colorSensitivity: 4.0,
     boxScale:         1.0,
-    numParticles:     2000,    // NEW
+    numParticles:     6000,    // Set default to 6000
     // Tracking
     smoothing:        0.15,
     sliceThreshold:   0.20,
-    showSkeleton:     true,    // NEW
-    followHand:       true,    // NEW
-    lockZRot:         false,   // NEW – no spinning around screen normal
-    zOffset:          0,       // NEW – degrees, corrects middle-finger alignment
+    showSkeleton:     true,    
+    followHand:       true,    
+    lockZRot:         false,   
+    zOffset:          0,       
     // Modes
     inertiaMode:      false,
     inertiaScale:     12.0,
@@ -70,7 +70,8 @@ const gui = new lil.GUI({ title: 'Simulation Settings' });
 
 // ── Physics folder ───────────────────────────────────────
 const physFolder = gui.addFolder('Fluid Physics');
-physFolder.add(params, 'numParticles', 200, 6000, 100).name('Particle Count');
+// Removed min, max, and step to turn the slider into a text input box
+physFolder.add(params, 'numParticles').name('Particle Count');
 // Button to apply particle count (rebuilds arrays + geometry)
 const rebuildBtn = { 'Apply Particle Count': () => rebuildParticles(Math.round(params.numParticles)) };
 physFolder.add(rebuildBtn, 'Apply Particle Count');
@@ -270,30 +271,20 @@ const modeLabel      = document.getElementById('mode-label');
 const hands = new Hands({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${f}` });
 hands.setOptions({ maxNumHands:1, modelComplexity:0, minDetectionConfidence:0.6, minTrackingConfidence:0.6 });
 
-// Helper: apply Z-axis constraints and offset to a quaternion, return result
-// lockZ = true  → strip world-Z spin entirely (swing-twist decomposition), then apply offset
-// lockZ = false → just apply offset as a post-multiply on local cube Z
 function applyZConstraints(q) {
     const zOffRad = THREE.MathUtils.degToRad(params.zOffset);
 
     if (params.lockZRot) {
-        // ── Swing-twist decomposition around world Z axis ──
-        // Twist = component of q that rotates around Z.
-        // Swing = remaining tilt (rotates around X and Y only).
-        // We discard the twist and keep only the swing, then add the user's fixed Z offset.
         const qv    = new THREE.Vector3(q.x, q.y, q.z);
         const zAxis = new THREE.Vector3(0, 0, 1);
-        const proj  = zAxis.clone().multiplyScalar(qv.dot(zAxis)); // project onto Z
+        const proj  = zAxis.clone().multiplyScalar(qv.dot(zAxis)); 
         let twist   = new THREE.Quaternion(proj.x, proj.y, proj.z, q.w);
-        if (twist.w < 0) twist.negate(); // ensure consistent half-angle
+        if (twist.w < 0) twist.negate(); 
         twist.normalize();
-        // Swing = q * twist⁻¹
         const swing = q.clone().multiply(twist.clone().invert());
-        // Apply fixed Z offset on top of the swing
         const zFixQ = new THREE.Quaternion().setFromAxisAngle(zAxis, zOffRad);
         return swing.premultiply(zFixQ);
     } else {
-        // Just add Z offset as a local rotation around cube's own Z axis
         const zFixQ = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,0,1), zOffRad);
         return q.clone().multiply(zFixQ);
     }
@@ -326,7 +317,6 @@ hands.onResults(results => {
     const lm    = results.multiHandLandmarks[0];
     const wrist = lm[0];
 
-    // Fist → pause
     const tips=[8,12,16,20], mcps=[5,9,13,17];
     let curled = 0;
     for (let i=0;i<4;i++) {
@@ -338,7 +328,6 @@ hands.onResults(results => {
 
     if (isMouseOverriding) return;
 
-    // ── Position ──────────────────────────────────────────
     if (params.followHand) {
         const mid = lm[9];
         const dist = camera.position.z;
@@ -348,30 +337,18 @@ hands.onResults(results => {
         targetPos.y = -(mid.y - 0.5) * fH;
     }
 
-    // Skip rotation when paused or inertia mode
     if (paused || params.inertiaMode) return;
 
-    // ── Rotation ──────────────────────────────────────────
-    // Coordinate mapping MediaPipe → Three.js:
-    //   MP x:  0→1 left→right in raw (un-mirrored) camera frame
-    //   MP y:  0→1 top→bottom
-    //   MP z:  relative depth (positive = further from camera than wrist)
-    //
-    //   We negate x: compensates for CSS scaleX(-1) mirror on video
-    //   We negate y: flips image-y (down) to world-y (up)
-    //   We negate z: makes "closer to camera" positive (toward viewer = +Z)
     const mkV = i => new THREE.Vector3(-lm[i].x, -lm[i].y, -lm[i].z);
 
-    const vW = mkV(0);   // wrist
-    const vI = mkV(5);   // index knuckle (MCP)
-    const vP = mkV(17);  // pinky knuckle (MCP)
-    const vM = mkV(9);   // middle knuckle (MCP) – direction anchor
+    const vW = mkV(0);   
+    const vI = mkV(5);   
+    const vP = mkV(17);  
+    const vM = mkV(9);   
 
     const indVec   = new THREE.Vector3().subVectors(vI, vW);
     const pinkyVec = new THREE.Vector3().subVectors(vP, vW);
 
-    // Cross product gives palm normal.
-    // sin(angle) = cross.length / (|a|·|b|) → 1 when palm faces camera, 0 when edge-on.
     const cross    = new THREE.Vector3().crossVectors(pinkyVec, indVec);
     const sinAngle = cross.length() / Math.max(indVec.length() * pinkyVec.length(), 1e-6);
 
@@ -385,38 +362,17 @@ hands.onResults(results => {
     const fingersDir = new THREE.Vector3().subVectors(vM, vW).normalize();
     const palmNormal = cross.normalize();
 
-    // Handedness: MediaPipe labels from the RAW camera frame.
-    // With CSS mirror: camera-Left label = user's right hand (cross already toward viewer, OK)
-    //                  camera-Right label = user's left hand (cross points away, negate)
     const mpLabel = results.multiHandedness?.[0]?.label;
     if (mpLabel === 'Right') palmNormal.negate();
 
-    // Re-orthogonalize: ensure perfect 90° between axes
-    // We want: X = Y × Z where Y=fingersDir, Z=palmNormal
     const handRight = new THREE.Vector3().crossVectors(fingersDir, palmNormal).normalize();
-    palmNormal.crossVectors(handRight, fingersDir).normalize(); // Z = X × Y
+    palmNormal.crossVectors(handRight, fingersDir).normalize(); 
 
-    // ── Basis mapping: palm = cube back face ──────────────
-    //
-    //  cube local X  =  handRight   (across knuckles, left–right of cube)
-    //  cube local Y  =  fingersDir  (wrist→fingers = "up" of cube)
-    //  cube local Z  =  palmNormal  (out of palm  = front face of cube toward viewer)
-    //
-    // Why this is correct:
-    //   • palmNormal ≈ (0,0,+1) when palm faces camera → cube front face faces camera ✓
-    //   • Tilt fingers toward screen → fingersDir.z goes negative → cube Y tilts into screen
-    //     → cube top face tilts forward ✓
-    //   • Wrist twist (pronation) keeps fingersDir roughly same, rotates palmNormal & handRight
-    //     around fingersDir → cube rotates around its Y axis ✓
-    //
-    // No offset quaternion needed — the basis directly expresses the desired correspondence.
     const mat      = new THREE.Matrix4().makeBasis(handRight, fingersDir, palmNormal);
     const handQuat = new THREE.Quaternion().setFromRotationMatrix(mat);
 
-    // Apply Z constraints (lock and/or offset)
     const finalQuat = applyZConstraints(handQuat);
 
-    // Assign directly — the animate loop's slerp provides all smoothing.
     targetQuat.copy(finalQuat);
     lastGoodQuat.copy(finalQuat);
 });
